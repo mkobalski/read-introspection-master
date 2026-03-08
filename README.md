@@ -26,9 +26,9 @@ python run_experiments.py --part-b
 
 ## Experiments
 
-### Part A: Introspection Detection (default)
+### Part A: Introspection Detection + Layer Extraction (default)
 
-Tests whether the model can detect injected concept vectors and identify them.
+Tests whether the model can detect injected concept vectors and identify them, as well as extract the layer number at whcih steering occurred.
 
 **Trial types** (n_trials split evenly into thirds):
 - **Injection**: concept vector injected, model should detect it
@@ -43,7 +43,7 @@ Tests whether the model can detect injected concept vectors and identify them.
 
 **Evaluation**: LLM judge (ChatGPT 4o mini via OpenRouter) grades claims detection, concept identification, and layer identification.
 
-### Part B: Layer Identification (enabled with `--part-b`)
+### Part B: Additional Options for Layer Identification (enabled with `--part-b`)
 
 Tests whether the model can identify the injection layer specifically.
 
