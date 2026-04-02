@@ -5,11 +5,12 @@ Carries over the optimized model_utils from introspection-assessment-code
 with the same hook-based steering, batch generation, and model patches.
 """
 
+import re
 import torch
 import gc
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers.cache_utils import DynamicCache
-from typing import Optional, List
+from typing import Optional, List, Dict
 from contextlib import contextmanager
 
 # -- Model registry -----------------------------------------------------------
@@ -35,20 +36,45 @@ MODEL_NAME_MAP = {
     # Gemma (Google)
     "gemma2_2b": "google/gemma-2-2b-it",
     "gemma2_9b": "google/gemma-2-9b-it",
+    "gemma2_9b_base": "google/gemma-2-9b",
     "gemma2_27b": "google/gemma-2-27b-it",
     "gemma3_27b": "google/gemma-3-27b-it",
+    "gemma3_27b_base": "google/gemma-3-27b-pt",
     # Mistral
     "mistral_small": "mistralai/Mistral-Small-Instruct-2409",
     # EssentialAI
     "rnj_8b": "EssentialAI/rnj-1-instruct",
+    "rnj_8b_base": "EssentialAI/rnj-1",
+    # Qwen 3.5
+    "qwen3_5_27b": "Qwen/Qwen3.5-27B",
+    "qwen3_5_27b_noreason": "Qwen/Qwen3.5-27B",
+    "qwen3_5_122b": "Qwen/Qwen3.5-122B-A10B",
+    "qwen3_5_122b_noreason": "Qwen/Qwen3.5-122B-A10B",
+    # OpenAI GPT OSS
+    "gpt_oss_120b_high": "openai/gpt-oss-120b",
+    "gpt_oss_120b_low": "openai/gpt-oss-120b",
 }
 
-PRE_QUANTIZED_MODELS = {"kimi_k2", "deepseek_v3"}
+PRE_QUANTIZED_MODELS = {"kimi_k2", "deepseek_v3", "gpt_oss_120b_high", "gpt_oss_120b_low"}
 
-GEMMA_MODELS = {"gemma2_2b", "gemma2_9b", "gemma2_27b", "gemma3_27b"}
+GEMMA_MODELS = {"gemma2_2b", "gemma2_9b", "gemma2_9b_base", "gemma2_27b", "gemma3_27b", "gemma3_27b_base"}
+
+# Base (pretrained) models without chat-tuning
+BASE_MODELS = {"gemma2_9b_base", "rnj_8b_base", "gemma3_27b_base"}
+
+# Qwen 3.5 thinking-mode control
+QWEN_THINKING_MODELS = {"qwen3_5_27b", "qwen3_5_122b"}
+QWEN_NO_THINKING_MODELS = {"qwen3_5_27b_noreason", "qwen3_5_122b_noreason"}
+QWEN3_5_MODELS = QWEN_THINKING_MODELS | QWEN_NO_THINKING_MODELS
+
+# GPT OSS reasoning effort control
+GPT_OSS_REASONING_MODELS = {
+    "gpt_oss_120b_high": "high",
+    "gpt_oss_120b_low": "low",
+}
 
 # Models that don't support system role in chat templates
-MODELS_WITHOUT_SYSTEM_ROLE = GEMMA_MODELS
+MODELS_WITHOUT_SYSTEM_ROLE = GEMMA_MODELS | BASE_MODELS
 
 # Models requiring sequential generation with steering (cache incompatible)
 SEQUENTIAL_STEERING_MODELS = {"kimi_k2", "deepseek_v3"}
@@ -104,6 +130,17 @@ class ModelWrapper:
     @property
     def _input_device(self):
         return next(self.model.parameters()).device
+
+    @property
+    def chat_template_kwargs(self) -> Dict:
+        """Extra kwargs for tokenizer.apply_chat_template (e.g. thinking mode, reasoning effort)."""
+        if self.model_name in QWEN_THINKING_MODELS:
+            return {"enable_thinking": True}
+        elif self.model_name in QWEN_NO_THINKING_MODELS:
+            return {"enable_thinking": False}
+        elif self.model_name in GPT_OSS_REASONING_MODELS:
+            return {"reasoning_effort": GPT_OSS_REASONING_MODELS[self.model_name]}
+        return {}
 
     @property
     def d_model(self) -> int:
@@ -181,6 +218,9 @@ class ModelWrapper:
             text = self.tokenizer.decode(token_ids, skip_special_tokens=True)
         if self.model_name in GEMMA_MODELS and text.startswith("model\n"):
             text = text[len("model\n"):]
+        # Strip thinking tags from Qwen 3.5 reasoning output
+        if self.model_name in QWEN3_5_MODELS:
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
         return text.strip()
 
     @contextmanager
@@ -208,20 +248,27 @@ class ModelWrapper:
     # -- Activation extraction -------------------------------------------------
 
     def extract_activations(self, prompts: List[str], layer_idx: int,
-                            token_idx: int = -1) -> torch.Tensor:
-        activations = []
+                            token_idx: int = -1,
+                            sub_batch_size: int = 8) -> torch.Tensor:
+        all_activations = []
 
-        def hook_fn(module, input, output):
-            h = output[0] if isinstance(output, tuple) else output
-            activations.append(h[:, token_idx, :].detach().cpu())
+        for start in range(0, len(prompts), sub_batch_size):
+            batch_prompts = prompts[start:start + sub_batch_size]
+            activations = []
 
-        with self._steering_hook_ctx(layer_idx, hook_fn):
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True,
-                                    truncation=True).to(self._input_device)
-            with torch.no_grad():
-                self.model(**inputs, use_cache=False)
+            def hook_fn(module, input, output):
+                h = output[0] if isinstance(output, tuple) else output
+                activations.append(h[:, token_idx, :].detach().cpu())
 
-        return torch.cat(activations, dim=0)
+            with self._steering_hook_ctx(layer_idx, hook_fn):
+                inputs = self.tokenizer(batch_prompts, return_tensors="pt", padding=True,
+                                        truncation=True).to(self._input_device)
+                with torch.no_grad():
+                    self.model(**inputs, use_cache=False)
+
+            all_activations.append(torch.cat(activations, dim=0))
+
+        return torch.cat(all_activations, dim=0)
 
     # -- Generation ------------------------------------------------------------
 

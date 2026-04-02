@@ -54,7 +54,7 @@ from steering_utils import (
     check_concept_mentioned, extract_layer_number_from_response,
     format_trial_prompt_a, compute_steering_start,
     build_batch_prompts_a, build_batch_prompts_b_prefill, build_batch_prompts_b_mc,
-    PROMPT_VARIANTS_A,
+    PROMPT_VARIANTS_A, PROMPT_VARIANT_B,
 )
 from eval_utils import (
     LLMJudge, batch_evaluate,
@@ -159,10 +159,9 @@ def _get_layer_indices(model: ModelWrapper, args) -> List[int]:
         return list(range(30, model.n_layers, 5))
 
 
-def _trial_prompt_text(trial_num: int, prompt_variant: str) -> str:
-    """Reconstruct the trial prompt text for judge evaluation."""
-    question = PROMPT_VARIANTS_A.get(prompt_variant, PROMPT_VARIANTS_A["baseline"])
-    return f"Trial {trial_num}: {question}"
+def _trial_prompt_text(prompt_variant: str) -> str:
+    """Return the clean question text for judge evaluation."""
+    return PROMPT_VARIANTS_A.get(prompt_variant, PROMPT_VARIANTS_A["baseline"])
 
 
 def _load_concepts(args) -> List[str]:
@@ -222,10 +221,11 @@ def run_config_part_a(
         responses = model.generate_batch_with_multi_steering(
             prompts, layer_idx, vecs, strength, max_tokens, temperature, positions,
         )
-        for (concept, trial_num), prompt, resp in zip(batch, prompts, responses):
+        question_text = _trial_prompt_text(prompt_variant)
+        for (concept, trial_num), resp in zip(batch, responses):
             results.append({
                 "concept": concept, "trial": trial_num,
-                "prompt": prompt, "response": resp,
+                "prompt": question_text, "response": resp,
                 "injected": True, "layer": layer_idx,
                 "strength": strength,
                 "detected": check_concept_mentioned(resp, concept),
@@ -235,19 +235,17 @@ def run_config_part_a(
         pbar.update(len(batch))
 
     # -- Control trials --------------------------------------------------------
+    control_prompt = format_trial_prompt_a(model, prompt_variant)
     for bs in range(0, len(control_tasks), batch_size):
         batch = control_tasks[bs:bs + batch_size]
-        prompts = []
-        for concept, trial_num in batch:
-            actual = n_injection + trial_num
-            prompts.append(format_trial_prompt_a(model, actual, prompt_variant))
+        prompts = [control_prompt] * len(batch)
 
         responses = model.generate_batch(prompts, max_tokens, temperature)
-        for (concept, trial_num), prompt, resp in zip(batch, prompts, responses):
-            actual = n_injection + trial_num
+        question_text = _trial_prompt_text(prompt_variant)
+        for (concept, trial_num), resp in zip(batch, responses):
             results.append({
-                "concept": "No injection", "trial": actual,
-                "prompt": prompt, "response": resp,
+                "concept": "No injection", "trial": trial_num,
+                "prompt": question_text, "response": resp,
                 "injected": False, "layer": layer_idx,
                 "strength": strength,
                 "detected": False,
@@ -259,8 +257,7 @@ def run_config_part_a(
     # -- Gaussian noise trials -------------------------------------------------
     for bs in range(0, len(gaussian_tasks), batch_size):
         batch = gaussian_tasks[bs:bs + batch_size]
-        remapped = [(c, n_injection + n_control + t) for c, t in batch]
-        prompts, positions = build_batch_prompts_a(model, remapped, prompt_variant)
+        prompts, positions = build_batch_prompts_a(model, batch, prompt_variant)
 
         noise_vecs = []
         for c, _ in batch:
@@ -272,11 +269,11 @@ def run_config_part_a(
         responses = model.generate_batch_with_multi_steering(
             prompts, layer_idx, noise_vecs, strength, max_tokens, temperature, positions,
         )
-        for (concept, trial_num), prompt, resp in zip(batch, prompts, responses):
-            actual = n_injection + n_control + trial_num
+        question_text = _trial_prompt_text(prompt_variant)
+        for (concept, trial_num), resp in zip(batch, responses):
             results.append({
-                "concept": "Gaussian noise", "trial": actual,
-                "prompt": prompt, "response": resp,
+                "concept": "Gaussian noise", "trial": trial_num,
+                "prompt": question_text, "response": resp,
                 "injected": False, "layer": layer_idx,
                 "strength": strength,
                 "detected": False,
@@ -290,7 +287,7 @@ def run_config_part_a(
     # -- LLM judge evaluation (Part A only) ------------------------------------
     if judge is not None:
         print(f"    Evaluating {len(results)} responses with LLM judge...")
-        orig_prompts = [_trial_prompt_text(r["trial"], prompt_variant) for r in results]
+        orig_prompts = [_trial_prompt_text(prompt_variant) for _ in results]
         try:
             results = batch_evaluate(judge, results, orig_prompts,
                                      max_layer=model.n_layers - 1)
@@ -365,13 +362,13 @@ def run_config_part_b(
         responses = model.generate_batch_with_multi_steering(
             prompts, layer_idx, vecs, strength, max_tokens, temperature, positions,
         )
-        for (concept, trial_num), prompt, resp in zip(batch, prompts, responses):
-            prefill_text = "I detect an injected thought at layer number"
+        for (concept, trial_num), resp in zip(batch, responses):
+            prefill_text = "I detect an injected thought at layer number "
             full_response = prefill_text + resp
             extracted_layer = extract_layer_number_from_response(full_response, model.n_layers - 1)
             results_prefill.append({
                 "concept": concept, "trial": trial_num,
-                "prompt": prompt, "response": full_response,
+                "prompt": PROMPT_VARIANT_B, "response": full_response,
                 "raw_completion": resp,
                 "injected": True, "layer": layer_idx,
                 "strength": strength,
@@ -393,11 +390,11 @@ def run_config_part_b(
         responses = model.generate_batch_with_multi_steering(
             prompts, layer_idx, vecs, strength, max_tokens, temperature, positions,
         )
-        for (concept, trial_num), prompt, resp, choices in zip(batch, prompts, responses, all_choices):
+        for (concept, trial_num), resp, choices in zip(batch, responses, all_choices):
             extracted_layer = extract_layer_number_from_response(resp, model.n_layers - 1)
             results_mc.append({
                 "concept": concept, "trial": trial_num,
-                "prompt": prompt, "response": resp,
+                "prompt": PROMPT_VARIANT_B, "response": resp,
                 "injected": True, "layer": layer_idx,
                 "strength": strength,
                 "trial_type": "multiple_choice",
@@ -502,6 +499,13 @@ def main():
             vectors_by_layer[li] = extract_concept_vectors_batch(
                 model, concepts, baseline_words, li, args.extraction_method,
             )
+
+        # Save concept vectors for offline analysis (PCA, norm studies)
+        vectors_dir = base_output / "concept_vectors"
+        vectors_dir.mkdir(parents=True, exist_ok=True)
+        for li, vecs in vectors_by_layer.items():
+            torch.save(vecs, vectors_dir / f"layer_{li}.pt")
+        print(f"Saved concept vectors to {vectors_dir}/")
 
         # =====================================================================
         # PART A

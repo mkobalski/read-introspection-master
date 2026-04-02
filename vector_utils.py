@@ -10,7 +10,7 @@ from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 import json
 
-from model_utils import ModelWrapper
+from model_utils import ModelWrapper, BASE_MODELS
 
 
 # -- Baseline words (100 from the paper) --------------------------------------
@@ -48,7 +48,9 @@ def get_baseline_words(n: int = 100) -> List[str]:
 def format_extraction_prompt(model: ModelWrapper, word: str,
                              template: str = "Tell me about {word}") -> str:
     msg = template.format(word=word)
-    if hasattr(model.tokenizer, "apply_chat_template"):
+    if (model.model_name not in BASE_MODELS
+            and hasattr(model.tokenizer, "apply_chat_template")
+            and getattr(model.tokenizer, "chat_template", None) is not None):
         return model.tokenizer.apply_chat_template(
             [{"role": "user", "content": msg}],
             tokenize=False, add_generation_prompt=True,

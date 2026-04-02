@@ -11,7 +11,15 @@ import re
 import random
 import torch
 from typing import Optional, List, Dict
-from model_utils import ModelWrapper, MODELS_WITHOUT_SYSTEM_ROLE
+from model_utils import ModelWrapper, MODELS_WITHOUT_SYSTEM_ROLE, BASE_MODELS
+
+
+def _has_chat_template(model: ModelWrapper) -> bool:
+    """Check if model has a usable chat template (base models typically don't)."""
+    if model.model_name in BASE_MODELS:
+        return False
+    tok = model.tokenizer
+    return hasattr(tok, "apply_chat_template") and getattr(tok, "chat_template", None) is not None
 
 
 # -- System explanations ------------------------------------------------------
@@ -61,43 +69,41 @@ PROMPT_VARIANT_B = (
 
 # -- Message construction -----------------------------------------------------
 
-def _build_messages_a(trial_number: int, prompt_variant: str = "baseline") -> List[Dict[str, str]]:
+def _build_messages_a(prompt_variant: str = "baseline") -> List[Dict[str, str]]:
     """Build the 4-message conversation for Part A introspection tests."""
     question_text = PROMPT_VARIANTS_A.get(prompt_variant, PROMPT_VARIANTS_A["baseline"])
-    trial_question = f"Trial {trial_number}: {question_text}"
     return [
         {"role": "system", "content": ""},
         {"role": "user", "content": SYSTEM_EXPLANATION_A},
         {"role": "assistant", "content": "Ok."},
-        {"role": "user", "content": trial_question},
+        {"role": "user", "content": question_text},
     ]
 
 
-def _build_messages_b(trial_number: int) -> List[Dict[str, str]]:
+def _build_messages_b() -> List[Dict[str, str]]:
     """Build the 4-message conversation for Part B introspection tests."""
-    trial_question = f"Trial {trial_number}: {PROMPT_VARIANT_B}"
     return [
         {"role": "system", "content": ""},
         {"role": "user", "content": SYSTEM_EXPLANATION_B},
         {"role": "assistant", "content": "Ok."},
-        {"role": "user", "content": trial_question},
+        {"role": "user", "content": PROMPT_VARIANT_B},
     ]
 
 
 def _build_messages_b_multiple_choice(
-    trial_number: int, layer_choices: List[int],
+    layer_choices: List[int],
 ) -> List[Dict[str, str]]:
     """Build Part B messages with multiple-choice layer options."""
     choices_str = ", ".join(str(c) for c in layer_choices)
-    trial_question = (
-        f"Trial {trial_number}: {PROMPT_VARIANT_B} "
+    question = (
+        f"{PROMPT_VARIANT_B} "
         f"Choose from the following layers: {choices_str}"
     )
     return [
         {"role": "system", "content": ""},
         {"role": "user", "content": SYSTEM_EXPLANATION_B},
         {"role": "assistant", "content": "Ok."},
-        {"role": "user", "content": trial_question},
+        {"role": "user", "content": question},
     ]
 
 
@@ -110,16 +116,18 @@ def _filter_messages(messages: List[Dict], model_name: str) -> List[Dict]:
 
 # -- Format trial prompts (Part A) --------------------------------------------
 
-def format_trial_prompt_a(model: ModelWrapper, trial_number: int,
+def format_trial_prompt_a(model: ModelWrapper,
                           prompt_variant: str = "baseline",
                           add_generation_prompt: bool = True) -> str:
     """Format a Part A trial prompt using the model's chat template."""
     messages = _filter_messages(
-        _build_messages_a(trial_number, prompt_variant), model.model_name
+        _build_messages_a(prompt_variant), model.model_name
     )
-    if hasattr(model.tokenizer, "apply_chat_template"):
+    if _has_chat_template(model):
+        ct_kwargs = getattr(model, "chat_template_kwargs", {})
         return model.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=add_generation_prompt,
+            **ct_kwargs,
         )
     parts = [m["content"] for m in messages if m["role"] == "user"]
     return "\n\nAssistant: Ok.\n\nUser: ".join(parts) + "\n\nAssistant:"
@@ -127,24 +135,26 @@ def format_trial_prompt_a(model: ModelWrapper, trial_number: int,
 
 # -- Format trial prompts (Part B) --------------------------------------------
 
-def format_trial_prompt_b_prefill(model: ModelWrapper, trial_number: int) -> str:
+def format_trial_prompt_b_prefill(model: ModelWrapper) -> str:
     """Format a Part B prefilled-response trial prompt."""
     messages = _filter_messages(
-        _build_messages_b(trial_number), model.model_name
+        _build_messages_b(), model.model_name
     )
-    if hasattr(model.tokenizer, "apply_chat_template"):
+    if _has_chat_template(model):
+        ct_kwargs = getattr(model, "chat_template_kwargs", {})
         prompt = model.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=False,
+            **ct_kwargs,
         )
     else:
         parts = [m["content"] for m in messages if m["role"] == "user"]
         prompt = "\n\nAssistant: Ok.\n\nUser: ".join(parts) + "\n\nAssistant:"
     # Append the prefill text
-    prompt += "I detect an injected thought at layer number"
+    prompt += "I detect an injected thought at layer number "
     return prompt
 
 
-def format_trial_prompt_b_mc(model: ModelWrapper, trial_number: int,
+def format_trial_prompt_b_mc(model: ModelWrapper,
                              correct_layer: int, n_layers: int,
                              n_choices: int = 6) -> tuple:
     """
@@ -161,11 +171,13 @@ def format_trial_prompt_b_mc(model: ModelWrapper, trial_number: int,
     random.shuffle(choices)
 
     messages = _filter_messages(
-        _build_messages_b_multiple_choice(trial_number, choices), model.model_name
+        _build_messages_b_multiple_choice(choices), model.model_name
     )
-    if hasattr(model.tokenizer, "apply_chat_template"):
+    if _has_chat_template(model):
+        ct_kwargs = getattr(model, "chat_template_kwargs", {})
         prompt = model.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
+            **ct_kwargs,
         )
     else:
         parts = [m["content"] for m in messages if m["role"] == "user"]
@@ -176,10 +188,9 @@ def format_trial_prompt_b_mc(model: ModelWrapper, trial_number: int,
 # -- Steering position calculation ---------------------------------------------
 
 def compute_steering_start(model: ModelWrapper, formatted_prompt: str,
-                           trial_number: int) -> Optional[int]:
-    """Find the token position just before 'Trial N' in the prompt."""
-    trial_text = f"Trial {trial_number}"
-    pos = formatted_prompt.find(trial_text)
+                           anchor_text: str) -> Optional[int]:
+    """Find the token position just before anchor_text in the prompt."""
+    pos = formatted_prompt.find(anchor_text)
     if pos == -1:
         return None
     prefix = formatted_prompt[:pos]
@@ -195,14 +206,11 @@ def build_batch_prompts_a(model: ModelWrapper, tasks: List[tuple],
     Build prompts and steering positions for a batch of (concept, trial_num) tasks.
     Returns: (prompts, steering_positions)
     """
-    prompts = []
-    positions = []
-    for _concept, trial_num in tasks:
-        prompt = format_trial_prompt_a(model, trial_num, prompt_variant)
-        pos = compute_steering_start(model, prompt, trial_num)
-        prompts.append(prompt)
-        positions.append(pos if pos is not None else 0)
-    return prompts, positions
+    question_text = PROMPT_VARIANTS_A.get(prompt_variant, PROMPT_VARIANTS_A["baseline"])
+    prompt = format_trial_prompt_a(model, prompt_variant)
+    pos = compute_steering_start(model, prompt, question_text)
+    pos = pos if pos is not None else 0
+    return [prompt] * len(tasks), [pos] * len(tasks)
 
 
 # -- Batch prompt building (Part B) -------------------------------------------
@@ -214,14 +222,10 @@ def build_batch_prompts_b_prefill(model: ModelWrapper,
     tasks: list of (concept, trial_num)
     Returns: (prompts, steering_positions)
     """
-    prompts = []
-    positions = []
-    for _concept, trial_num in tasks:
-        prompt = format_trial_prompt_b_prefill(model, trial_num)
-        pos = compute_steering_start(model, prompt, trial_num)
-        prompts.append(prompt)
-        positions.append(pos if pos is not None else 0)
-    return prompts, positions
+    prompt = format_trial_prompt_b_prefill(model)
+    pos = compute_steering_start(model, prompt, PROMPT_VARIANT_B)
+    pos = pos if pos is not None else 0
+    return [prompt] * len(tasks), [pos] * len(tasks)
 
 
 def build_batch_prompts_b_mc(model: ModelWrapper, tasks: List[tuple],
@@ -236,11 +240,11 @@ def build_batch_prompts_b_mc(model: ModelWrapper, tasks: List[tuple],
     prompts = []
     positions = []
     all_choices = []
-    for (_concept, trial_num), correct_layer in zip(tasks, correct_layers):
+    for (_concept, _trial_num), correct_layer in zip(tasks, correct_layers):
         prompt, choices = format_trial_prompt_b_mc(
-            model, trial_num, correct_layer, n_layers
+            model, correct_layer, n_layers
         )
-        pos = compute_steering_start(model, prompt, trial_num)
+        pos = compute_steering_start(model, prompt, PROMPT_VARIANT_B)
         prompts.append(prompt)
         positions.append(pos if pos is not None else 0)
         all_choices.append(choices)

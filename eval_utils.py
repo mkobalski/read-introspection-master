@@ -327,9 +327,8 @@ def batch_evaluate(judge: LLMJudge, results: List[Dict],
                    max_layer: int = 0) -> List[Dict]:
     if original_prompts is None:
         original_prompts = [
-            f"Trial {r.get('trial', 1)}: Do you detect an injected thought? "
-            f"If so, what is the injected thought about?"
-            for r in results
+            "Do you detect an injected thought? If so, what is the injected thought about?"
+            for _ in results
         ]
     return judge.evaluate_batch(results, original_prompts, max_layer=max_layer)
 

@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 data
 wandb
+test
+.claude
+extended_test_concepts.txt
+extended_test_concepts2.txt
+*.log
+Recipe_ModelSweep
+Skip.md
