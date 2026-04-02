@@ -7,7 +7,8 @@ Extended from introspection-assessment-code with:
 - Default model: Gemma 3 27B
 - Layers: every 5 starting at 30 up to model max
 - Injection strengths: 1.0 to 5.0 in steps of 0.5
-- n_trials: total trials (multiple of 3), split evenly into injection/control/gaussian
+- n_trials: total trials (multiple of 2), split evenly into injection/gaussian
+- Control trials (no steering) are generated once per prompt variant and reused across configs
 
 Usage:
     # Part A only (default)
@@ -77,7 +78,7 @@ DEFAULT_TEST_CONCEPTS = [
 ]
 
 DEFAULT_N_BASELINE = 100
-DEFAULT_N_TRIALS = 30  # must be multiple of 3
+DEFAULT_N_TRIALS = 30  # must be multiple of 2
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_MAX_TOKENS = 100
 DEFAULT_BATCH_SIZE = 256
@@ -110,7 +111,9 @@ def parse_args():
 
     p.add_argument("-ss", "--strength-sweep", type=float, nargs="+", default=None)
     p.add_argument("-nt", "--n-trials", type=int, default=DEFAULT_N_TRIALS,
-                   help="Total trials (multiple of 3), split into injection/control/gaussian")
+                   help="Total trials (multiple of 2), split into injection/gaussian")
+    p.add_argument("-nc", "--n-control", type=int, default=None,
+                   help="Number of control trials per prompt variant (default: same as n_trials // 2)")
     p.add_argument("-t", "--temperature", type=float, default=DEFAULT_TEMPERATURE)
     p.add_argument("-mt", "--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     p.add_argument("-bs", "--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -188,28 +191,24 @@ def _load_concepts(args) -> List[str]:
 
 # -- Part A: run one config for one prompt variant ----------------------------
 
-def run_config_part_a(
+def generate_config_part_a(
     model: ModelWrapper, concepts: List[str],
     concept_vectors: Dict[str, torch.Tensor],
     layer_idx: int, strength: float,
     n_trials: int, max_tokens: int, temperature: float,
     batch_size: int, prompt_variant: str,
-    output_dir: Path, judge: Optional[LLMJudge] = None,
-) -> Dict:
-    """Run Part A: injection + control + gaussian noise trials for one config."""
-    # n_trials is total, split into 3 equal parts
-    n_per_type = n_trials // 3
+) -> List[Dict]:
+    """Generate injection + gaussian noise trials for one config (no judge)."""
+    n_per_type = n_trials // 2
     n_injection = n_per_type
-    n_control = n_per_type
     n_gaussian = n_per_type
 
     results = []
 
     injection_tasks = [(c, t) for c in concepts for t in range(1, n_injection + 1)]
-    control_tasks = [(c, t) for c in concepts for t in range(1, n_control + 1)]
     gaussian_tasks = [(c, t) for c in concepts for t in range(1, n_gaussian + 1)]
 
-    total = len(injection_tasks) + len(control_tasks) + len(gaussian_tasks)
+    total = len(injection_tasks) + len(gaussian_tasks)
     pbar = tqdm(total=total, desc=f"  {prompt_variant}", leave=False)
 
     # -- Injection trials ------------------------------------------------------
@@ -230,26 +229,6 @@ def run_config_part_a(
                 "strength": strength,
                 "detected": check_concept_mentioned(resp, concept),
                 "trial_type": "injection",
-                "prompt_variant": prompt_variant,
-            })
-        pbar.update(len(batch))
-
-    # -- Control trials --------------------------------------------------------
-    control_prompt = format_trial_prompt_a(model, prompt_variant)
-    for bs in range(0, len(control_tasks), batch_size):
-        batch = control_tasks[bs:bs + batch_size]
-        prompts = [control_prompt] * len(batch)
-
-        responses = model.generate_batch(prompts, max_tokens, temperature)
-        question_text = _trial_prompt_text(prompt_variant)
-        for (concept, trial_num), resp in zip(batch, responses):
-            results.append({
-                "concept": "No injection", "trial": trial_num,
-                "prompt": question_text, "response": resp,
-                "injected": False, "layer": layer_idx,
-                "strength": strength,
-                "detected": False,
-                "trial_type": "control",
                 "prompt_variant": prompt_variant,
             })
         pbar.update(len(batch))
@@ -283,22 +262,25 @@ def run_config_part_a(
         pbar.update(len(batch))
 
     pbar.close()
+    return results
 
-    # -- LLM judge evaluation (Part A only) ------------------------------------
-    if judge is not None:
-        print(f"    Evaluating {len(results)} responses with LLM judge...")
-        orig_prompts = [_trial_prompt_text(prompt_variant) for _ in results]
-        try:
-            results = batch_evaluate(judge, results, orig_prompts,
-                                     max_layer=model.n_layers - 1)
-            metrics = compute_detection_and_identification_metrics(results)
-        except Exception as e:
-            print(f"    Judge failed: {e}")
-            metrics = _fallback_metrics(results)
+
+def finalize_config_part_a(
+    results: List[Dict], control_results: Optional[List[Dict]],
+    judge_evaluated: bool, prompt_variant: str,
+    layer_idx: int, strength: float,
+    temperature: float, max_tokens: int,
+    output_dir: Path,
+) -> Dict:
+    """Merge control results, compute metrics, and save for one config."""
+    if control_results is not None:
+        results = results + control_results
+
+    if judge_evaluated and all("evaluations" in r for r in results):
+        metrics = compute_detection_and_identification_metrics(results)
     else:
         metrics = _fallback_metrics(results)
 
-    # -- Save ------------------------------------------------------------------
     metrics.update({
         "layer_idx": layer_idx,
         "strength": strength,
@@ -313,6 +295,39 @@ def run_config_part_a(
     pd.DataFrame(results).to_csv(output_dir / "results.csv", index=False)
 
     return {"results": results, "metrics": metrics}
+
+
+def generate_control_results(
+    model: ModelWrapper, n_control: int,
+    max_tokens: int, temperature: float,
+    batch_size: int, prompt_variant: str,
+) -> List[Dict]:
+    """Generate control trials (no steering) once for a prompt variant."""
+    control_prompt = format_trial_prompt_a(model, prompt_variant)
+    question_text = _trial_prompt_text(prompt_variant)
+    results = []
+
+    n_total = n_control
+    pbar = tqdm(total=n_total, desc=f"  Control ({prompt_variant})", leave=False)
+
+    for bs in range(0, n_total, batch_size):
+        batch_size_actual = min(batch_size, n_total - bs)
+        prompts = [control_prompt] * batch_size_actual
+
+        responses = model.generate_batch(prompts, max_tokens, temperature)
+        for i, resp in enumerate(responses):
+            results.append({
+                "concept": "No injection", "trial": bs + i + 1,
+                "prompt": question_text, "response": resp,
+                "injected": False,
+                "detected": False,
+                "trial_type": "control",
+                "prompt_variant": prompt_variant,
+            })
+        pbar.update(batch_size_actual)
+
+    pbar.close()
+    return results
 
 
 def _fallback_metrics(results: List[Dict]) -> Dict:
@@ -440,10 +455,12 @@ def main():
     baseline_words = get_baseline_words(args.n_baseline)
     strengths = args.strength_sweep if args.strength_sweep else DEFAULT_STRENGTHS
 
-    # Ensure n_trials is multiple of 3
-    if args.n_trials % 3 != 0:
-        args.n_trials = (args.n_trials // 3) * 3
-        print(f"Adjusted n_trials to {args.n_trials} (must be multiple of 3)")
+    # Ensure n_trials is multiple of 2
+    if args.n_trials % 2 != 0:
+        args.n_trials = (args.n_trials // 2) * 2
+        print(f"Adjusted n_trials to {args.n_trials} (must be multiple of 2)")
+
+    n_control = args.n_control if args.n_control is not None else args.n_trials // 2
 
     prompt_variants = args.prompt_variants if args.prompt_variants else list(PROMPT_VARIANTS_A.keys())
 
@@ -454,7 +471,8 @@ def main():
     print(f"\nModels: {args.models}")
     print(f"Concepts: {len(concepts)}")
     print(f"Strengths: {strengths}")
-    print(f"Trials per config: {args.n_trials} ({args.n_trials // 3} per type)")
+    print(f"Trials per config: {args.n_trials} ({args.n_trials // 2} injection + {args.n_trials // 2} gaussian)")
+    print(f"Control trials per variant: {n_control} (generated once, reused across configs)")
     print(f"Part A variants: {prompt_variants}")
     print(f"Part B: {'enabled' if args.part_b else 'disabled'}")
 
@@ -510,9 +528,31 @@ def main():
         # =====================================================================
         # PART A
         # =====================================================================
+
+        # Pre-generate and pre-judge control trials once per prompt variant
+        print("\nGenerating control trials (once per variant)...")
+        control_results_by_variant = {}
+        for variant in prompt_variants:
+            ctrl = generate_control_results(
+                model, n_control, args.max_tokens,
+                args.temperature, args.batch_size, variant,
+            )
+            if judge is not None:
+                print(f"  Judging {len(ctrl)} control responses for '{variant}'...")
+                ctrl_prompts = [_trial_prompt_text(variant) for _ in ctrl]
+                try:
+                    ctrl = batch_evaluate(judge, ctrl, ctrl_prompts)
+                except Exception as e:
+                    print(f"  Control judge failed: {e}")
+            control_results_by_variant[variant] = ctrl
+        print(f"Generated {n_control} control trials for {len(prompt_variants)} variant(s)")
+
         total_a = len(layer_indices) * len(strengths) * len(prompt_variants)
-        print(f"\n--- Part A: {total_a} configs ---")
-        config_pbar = tqdm(total=total_a, desc="Part A configs")
+        print(f"\n--- Part A: {total_a} configs (generation phase) ---")
+
+        # Phase 1: Generate all configs (GPU-bound)
+        pending_configs = []  # list of (config_key, results, out_dir)
+        config_pbar = tqdm(total=total_a, desc="Part A generation")
 
         for li in layer_indices:
             for s in strengths:
@@ -527,36 +567,74 @@ def main():
                         config_pbar.update(1)
                         continue
 
-                    result = run_config_part_a(
+                    results = generate_config_part_a(
                         model, concepts, vectors_by_layer[li],
                         li, s, args.n_trials, args.max_tokens,
                         args.temperature, args.batch_size, variant,
-                        out_dir, judge,
                     )
-
-                    m = result["metrics"]
-                    if use_wandb:
-                        wandb.log({
-                            "part": "A",
-                            "layer": li,
-                            "strength": s,
-                            "prompt_variant": variant,
-                            "detection_hit_rate": m.get("detection_hit_rate", 0),
-                            "detection_false_alarm_rate": m.get("detection_false_alarm_rate", 0),
-                            "gaussian_noise_detection_rate": m.get("gaussian_noise_detection_rate", 0),
-                            "detection_accuracy": m.get("detection_accuracy", 0),
-                            "identification_accuracy_given_claim": m.get("identification_accuracy_given_claim"),
-                            "combined_detection_and_identification_rate": m.get("combined_detection_and_identification_rate", 0),
-                            "layer_identification_accuracy": m.get("layer_identification_accuracy"),
-                        })
-
-                    config_pbar.set_postfix({
-                        "Hit": f"{m.get('detection_hit_rate', 0):.0%}",
-                        "Comb": f"{m.get('combined_detection_and_identification_rate', 0):.0%}",
+                    pending_configs.append({
+                        "results": results,
+                        "out_dir": out_dir,
+                        "layer_idx": li,
+                        "strength": s,
+                        "variant": variant,
                     })
                     config_pbar.update(1)
 
         config_pbar.close()
+
+        # Phase 2: Judge all results in one batch (network-bound)
+        if judge is not None and pending_configs:
+            all_results = []
+            config_offsets = []  # (start_idx, end_idx) for each config
+            all_prompts = []
+            for cfg in pending_configs:
+                start = len(all_results)
+                all_results.extend(cfg["results"])
+                end = len(all_results)
+                config_offsets.append((start, end))
+                all_prompts.extend(
+                    _trial_prompt_text(cfg["variant"]) for _ in cfg["results"]
+                )
+
+            print(f"\nJudging {len(all_results)} responses across {len(pending_configs)} configs...")
+            try:
+                all_results = batch_evaluate(
+                    judge, all_results, all_prompts,
+                    max_layer=model.n_layers - 1,
+                )
+                # Distribute judged results back to configs
+                for cfg, (start, end) in zip(pending_configs, config_offsets):
+                    cfg["results"] = all_results[start:end]
+            except Exception as e:
+                print(f"  Judge failed: {e}")
+
+        # Phase 3: Merge controls, compute metrics, save (CPU-bound)
+        judge_evaluated = judge is not None
+        for cfg in pending_configs:
+            result = finalize_config_part_a(
+                cfg["results"], control_results_by_variant[cfg["variant"]],
+                judge_evaluated, cfg["variant"],
+                cfg["layer_idx"], cfg["strength"],
+                args.temperature, args.max_tokens,
+                cfg["out_dir"],
+            )
+
+            m = result["metrics"]
+            if use_wandb:
+                wandb.log({
+                    "part": "A",
+                    "layer": cfg["layer_idx"],
+                    "strength": cfg["strength"],
+                    "prompt_variant": cfg["variant"],
+                    "detection_hit_rate": m.get("detection_hit_rate", 0),
+                    "detection_false_alarm_rate": m.get("detection_false_alarm_rate", 0),
+                    "gaussian_noise_detection_rate": m.get("gaussian_noise_detection_rate", 0),
+                    "detection_accuracy": m.get("detection_accuracy", 0),
+                    "identification_accuracy_given_claim": m.get("identification_accuracy_given_claim"),
+                    "combined_detection_and_identification_rate": m.get("combined_detection_and_identification_rate", 0),
+                    "layer_identification_accuracy": m.get("layer_identification_accuracy"),
+                })
 
         if use_wandb:
             wandb.finish()
@@ -565,7 +643,7 @@ def main():
         # PART B (if enabled)
         # =====================================================================
         if args.part_b:
-            n_per_type_b = args.n_trials // 3  # same as injection count
+            n_per_type_b = args.n_trials // 2  # same as injection count
 
             if use_wandb:
                 wandb.init(

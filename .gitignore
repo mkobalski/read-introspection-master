@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 data
+archive/data_*
+archive/*.log
 wandb
 test
 .claude
