@@ -170,9 +170,21 @@ python run_experiments.py --n-control 50
 
 ## Tracking
 
-All experiments log to [Weights & Biases](https://wandb.ai). Logged variables include
-model name, layer numbers, injection strengths, prompt variants, trial outcomes,
-concept detection accuracy, and layer identification accuracy.
+All experiments log to [Weights & Biases](https://wandb.ai) (`--wandb-project introspection-steering`).
+
+**Metrics** (logged per config via `wandb.log`):
+- Part A: detection hit/false-alarm rates, gaussian noise detection rate, detection accuracy, identification accuracy, combined rate, layer identification accuracy
+- Part B: prefill and multiple-choice layer accuracy
+
+**Per-trial data** (logged as `wandb.Table`):
+- `part_a_trials`: layer, strength, variant, trial type, concept, response text, injected/detected flags
+- `part_b_trials`: layer, strength, trial type, concept, response text, extracted layer, correctness
+
+**Artifacts** (logged as `wandb.Artifact`, type `experiment-data`):
+- `<model>_part_a_data`: all `results.json`/`results.csv` files + concept vectors (`.pt`)
+- `<model>_part_b_data`: all Part B `results.json`/`results.csv` files
+
+Disable with `--no-wandb`.
 
 ---
 

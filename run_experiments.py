@@ -509,6 +509,13 @@ def main():
                     "part_b": args.part_b,
                 },
             )
+            wandb_trial_table_a = wandb.Table(columns=[
+                "layer", "strength", "prompt_variant", "trial_type",
+                "concept", "trial", "response", "injected", "detected",
+            ])
+            wandb_artifact_a = wandb.Artifact(
+                f"{current_model}_part_a_data", type="experiment-data",
+            )
 
         # Extract concept vectors for all layers
         print("\nExtracting concept vectors...")
@@ -524,6 +531,9 @@ def main():
         for li, vecs in vectors_by_layer.items():
             torch.save(vecs, vectors_dir / f"layer_{li}.pt")
         print(f"Saved concept vectors to {vectors_dir}/")
+
+        if use_wandb:
+            wandb_artifact_a.add_dir(str(vectors_dir), name="concept_vectors")
 
         # =====================================================================
         # PART A
@@ -635,8 +645,27 @@ def main():
                     "combined_detection_and_identification_rate": m.get("combined_detection_and_identification_rate", 0),
                     "layer_identification_accuracy": m.get("layer_identification_accuracy"),
                 })
+                # Add per-trial rows to the table
+                for r in result["results"]:
+                    wandb_trial_table_a.add_data(
+                        cfg["layer_idx"], cfg["strength"], cfg["variant"],
+                        r.get("trial_type", ""), r.get("concept", ""),
+                        r.get("trial", 0), r.get("response", ""),
+                        r.get("injected", False), r.get("detected", False),
+                    )
+                # Add result files to artifact
+                wandb_artifact_a.add_file(
+                    str(cfg["out_dir"] / "results.json"),
+                    name=f"part_a/layer_{cfg['layer_idx']}_strength_{cfg['strength']}/{cfg['variant']}/results.json",
+                )
+                wandb_artifact_a.add_file(
+                    str(cfg["out_dir"] / "results.csv"),
+                    name=f"part_a/layer_{cfg['layer_idx']}_strength_{cfg['strength']}/{cfg['variant']}/results.csv",
+                )
 
         if use_wandb:
+            wandb.log({"part_a_trials": wandb_trial_table_a})
+            wandb.log_artifact(wandb_artifact_a)
             wandb.finish()
 
         # =====================================================================
@@ -657,6 +686,14 @@ def main():
                         "n_trials_per_type": n_per_type_b,
                         "part": "B",
                     },
+                )
+                wandb_trial_table_b = wandb.Table(columns=[
+                    "layer", "strength", "trial_type",
+                    "concept", "trial", "response",
+                    "extracted_layer", "layer_correct",
+                ])
+                wandb_artifact_b = wandb.Artifact(
+                    f"{current_model}_part_b_data", type="experiment-data",
                 )
 
             total_b = len(layer_indices) * len(strengths)
@@ -688,6 +725,21 @@ def main():
                             "prefill_layer_accuracy": m.get("prefill_layer_accuracy", 0),
                             "mc_layer_accuracy": m.get("mc_layer_accuracy", 0),
                         })
+                        for r in result["results"]:
+                            wandb_trial_table_b.add_data(
+                                li, s, r.get("trial_type", ""),
+                                r.get("concept", ""), r.get("trial", 0),
+                                r.get("response", ""),
+                                r.get("extracted_layer"), r.get("layer_correct", False),
+                            )
+                        wandb_artifact_b.add_file(
+                            str(out_dir / "results.json"),
+                            name=f"part_b/layer_{li}_strength_{s}/results.json",
+                        )
+                        wandb_artifact_b.add_file(
+                            str(out_dir / "results.csv"),
+                            name=f"part_b/layer_{li}_strength_{s}/results.csv",
+                        )
 
                     config_pbar.set_postfix({
                         "Prefill": f"{m.get('prefill_layer_accuracy', 0):.0%}",
@@ -698,6 +750,8 @@ def main():
             config_pbar.close()
 
             if use_wandb:
+                wandb.log({"part_b_trials": wandb_trial_table_b})
+                wandb.log_artifact(wandb_artifact_b)
                 wandb.finish()
 
         # Cleanup model
