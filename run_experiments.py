@@ -61,6 +61,7 @@ from eval_utils import (
     LLMJudge, batch_evaluate,
     compute_detection_and_identification_metrics, save_evaluation_results,
 )
+from analyze_data import run_analysis
 
 # -- Defaults -----------------------------------------------------------------
 
@@ -756,6 +757,18 @@ def main():
 
         # Cleanup model
         model.cleanup()
+
+        # Run analysis figures for baseline variant
+        if "baseline" in prompt_variants:
+            print(f"\n--- Generating analysis figures for {current_model} ---")
+            run_analysis(
+                data_dir=base_output / "part_a",
+                out_dir=base_output / "analysis",
+                layers=layer_indices,
+                strengths=strengths,
+                variant="baseline",
+            )
+
         print(f"\nDone for {current_model}!")
 
 
